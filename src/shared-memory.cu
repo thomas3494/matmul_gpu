@@ -16,7 +16,7 @@ typedef float4 vec4;
 #define NR 8
 
 #define MB 128
-#define NB 128
+#define NB 256
 /* We block k to hide latency and get vectorized loads. */
 #define KB 8
 
