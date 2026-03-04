@@ -1,3 +1,7 @@
+/**
+ * Simple 2-level blocking.
+ **/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <cublas_v2.h>
@@ -5,12 +9,14 @@
 #include <test_code.h>
 #include <assert.h>
 
-#define MR 8
-#define NR 8
+typedef float4 vec4;
 
+template<int MR, int NR>
 __device__
 void outer_product(float c[MR][NR], float a[MR], float b[NR])
 {
+    /* We could use one register instead of MR per load of a,
+     * but it does not take that many registers, so maybe not necessary. */
     for (int i = 0; i < MR; i++) {
         for (int j = 0; j < NR; j++) {
             c[i][j] += a[i] * b[j];
@@ -19,68 +25,147 @@ void outer_product(float c[MR][NR], float a[MR], float b[NR])
 }
 
 /**
- * Duplicates column of a matrix across all rows in a 2D thread grid.
+ * Duplicates column p across all rows in a 2D thread grid.
  **/
+template<int MB, int KB, int NB, int MR, int NR>
 __device__
-void bcast_col(int m , float *reg /* [m]                  */,
-               int ld, float *x   /* [m * blockDim.y, ld] */)
+void bcast_col(float a_reg[MR], float a_sh[MB][KB], int p)
 {
-    for (int i = 0; i < m; i++) {
-        reg[i] = x[(blockDim.y * i + threadIdx.y) * ld];
+    int t1 = threadIdx.x / (NB / NR);
+
+    for (int i = 0; i < MR; i++) {
+        a_reg[i] = a_sh[t1 * MR + i][p];
     }
 }
 
 /**
- * Duplicates array across all columns in a 2D thread grid.
+ * Duplicates row p across all columns in a 2D thread grid.
  **/
+template<int KB, int NB, int NR>
 __device__
-void bcast_row(int m , float *reg  /* [m]              */,
-               float *x            /* [m * blockDim.x] */)
+void bcast_row(float b_reg[NR], float b_sh[KB][NB], int p)
 {
-    for (int i = 0; i < m; i++) {
-        reg[i] = x[blockDim.x * i + threadIdx.x];
+    int t2 = threadIdx.x % (NB / NR);
+
+    vec4 *x   = (vec4 *)(&b_sh[p][t2 * NR]);
+    vec4 *res = (vec4 *)b_reg;
+    for (int i = 0; i < NR / 4; i++) {
+        res[i] = x[i];
     }
 }
 
+template<int MB, int KB, int THREADS>
+__device__ void load_A(float a_sh[MB][KB], float *a, int ld)
+{
+    /**
+     * Thread space: [4 * THREADS / KB, KB / 4]
+     **/
+    int t1 = threadIdx.x / (KB / 4);
+    int t2 = threadIdx.x % (KB / 4);
+
+    /* Could make blockDim.x a macro as well. For this case, we know
+     * the loop is precisely one iteration. */
+    for (; t1 < MB; t1 += 4 * THREADS / KB) {
+        vec4 *a_vec  = (vec4 *)(a + t1 * ld + 4 * t2);
+        vec4 *sh_vec = (vec4 *)(&a_sh[t1][4 * t2]);
+        sh_vec[0] = a_vec[0];
+    }
+}
+
+template<int KB, int NB, int THREADS>
+__device__ void load_B(float b_sh[KB][NB], const float *b, int ld)
+{
+    /**
+     * Thread space: [4 * blockDim.x / NB, NB / 4]
+     **/
+    int t1 = threadIdx.x / (NB / 4);
+    int t2 = threadIdx.x % (NB / 4);
+    for (; t1 < KB; t1 += 4 * THREADS / NB) {
+        vec4 *b_vec  = (vec4 *)(b + t1 * ld + 4 * t2);
+        vec4 *sh_vec = (vec4 *)(&b_sh[t1][4 * t2]);
+        sh_vec[0] = b_vec[0];
+    }
+}
+
+template<int MB, int KB, int NB, int THREADS>
+__device__
+void load_pp(float a_sh[MB][KB], float b_sh[KB][NB],
+             float *a, float *b, int k, int n, int pp)
+{
+    load_A<MB, KB, THREADS>(a_sh, a + pp    , k);
+    load_B<KB, NB, THREADS>(b_sh, b + pp * n, n);
+}
+
+template<int MB, int KB, int NB, int MR, int NR, int THREADS>
+__device__
+void comp_pp(float c_reg[MR][NR], float a_reg[MR], float b_reg[NR],
+             float a_sh[MB][KB], float b_sh[KB][NB])
+{
+    for (int p = 0; p < KB; p++) {
+        bcast_col<MB, KB, NB, MR, NR>(b_reg, a_sh, p);
+        bcast_row<KB, NB, NR>(b_reg, b_sh, p);
+        outer_product<MR, NR>(c_reg, a_reg, b_reg);
+    }
+}
+
+template<int MB, int KB, int NB, int MR, int NR, int THREADS>
 __global__
 void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
 {
-    assert(gridDim.y * blockDim.y * MR == m);
-    assert(gridDim.x * blockDim.x * NR == n);
     assert(k % KB == 0);
+
+    __shared__ float a_sh[MB][KB];
+    __shared__ float b_sh[KB][NB];
 
     float c_reg[MR][NR] = {(float)0};
     float a_reg[MR];
     float b_reg[NR];
 
-    a += blockIdx.y * blockDim.y * MR * k;
-    b += blockIdx.x * blockDim.x * NR;
-    c += blockIdx.y * blockDim.y * MR * n + blockIdx.x * blockDim.x * NR;
+    /**
+     * Thread space: [MB / MR, NB / NR]
+     * Block space:  [m  / MB, n  / NB]
+     **/
+    int t1 = threadIdx.x / (NB / NR);
+    int t2 = threadIdx.x % (NB / NR);
+    int b1 = blockIdx.x  / (n / NB);
+    int b2 = blockIdx.x  % (n / NB);
 
-    for (int p = 0; p < k; p++) {
-        bcast_col(MR, a_reg, k, a + p    );
-        bcast_row(NR, b_reg,    b + p * n);
-        outer_product(c_reg, a_reg, b_reg);
+    a += b1 * MB * k;
+    b += b2 * NB;
+    c += b1 * MB * n + b2 * NB;
+
+    for (int pp = 0; pp < k; pp += KB) {
+        load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, a, b, k, n, pp);
+        __syncthreads();
+        comp_pp<MB, KB, NB, MR, NR, THREADS>(c_reg, a_reg, b_reg, a_sh, b_sh);
     }
 
     for (int i = 0; i < MR; i++) {
         for (int j = 0; j < NR; j++) {
-            int glob_i = i * blockDim.y + threadIdx.y;
-            int glob_j = j * blockDim.x + threadIdx.x;
+            int glob_i = t1 * MR + i;
+            int glob_j = t2 * NR + j;
             c[glob_i * n + glob_j] = c_reg[i][j];
         }
     }
 }
 
+/**
+ * MB: reuse of B from global -> shared
+ * KB: allows for vectorized loads of B, some latency hiding,
+       and instruction level parallelism for loads
+ * NB: reuse of A from global -> shared
+ * MR: reuse of B from shared -> registers
+ * NR: reuse of A from shared -> registers
+ **/
+template<int MB = 128, int KB = 8, int NB = 256, int MR = 8, int NR = 8>
 void matmul(float *c, float *a, float *b, int m, int k, int n)
 {
-    int threads_x = 32; // n
-    int threads_y = 16; // m
+    constexpr int THREADS = (MB / MR) * (NB / NR);
+    int blocks    = (m / MB) * (n / NB);
 
-    dim3 threadsPerBlock(threads_x, threads_y);
-    dim3 blocks(n / (NR * threads_x), m / (MR * threads_y));
-    
-    matmul_kernel<<<blocks, threadsPerBlock>>>(c, a, b, m, k, n);
+    matmul_kernel<MB, KB, NB, MR, NR, THREADS>
+                 <<<blocks, THREADS>>>
+                 (c, a, b, m, k, n);
     CUDA_SAFE(cudaDeviceSynchronize());
     CUDA_SAFE(cudaPeekAtLastError());
 }
@@ -113,6 +198,7 @@ int main(int argc, char **argv)
 
     duration /= 1e3;
 
+    fprintf(stderr, "Duration: %lf s\n", duration);
     fprintf(stderr, "Gflops/s: ");
     printf("%f\n", 2.0 * m * n * k / duration / 1e9);
 

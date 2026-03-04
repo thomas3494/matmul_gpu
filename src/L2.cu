@@ -1,6 +1,24 @@
 /**
- * We load blocks of A, B in shared memory for multiple iterations of k,
- * so that we can hide some latency.
+ * The idea is as follows.
+ * To compute the column of C marked with x's, we read that column
+ * of B in order 1, 2, 3, 4. So if these columns are computed at the same
+ * time, we can store it in L2 (4 MB on 3070).
+ * 
+ *
+ *              (1|      )
+ *              (2|      )
+ *              (3|      )
+ *              (4|      )
+ * 
+ *  (1|2|3|4)   (x|      )
+ *  (1|2|3|4)   (x|      )
+ *  (1|2|3|4)   (x|      )
+ *  (1|2|3|4)   (x|      )
+ *
+ * We make the blocks rectangular NB > MB, so we have enough blocks per column
+ * to satisfy the SMs. Each thread block then loops over the columns.
+ * The reuse of L2 is multiplied by the number of SMs, so small MB is ok.
+ * 32 x 1024.
  **/
 
 #include <stdio.h>
@@ -124,44 +142,47 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
 
     /**
      * Thread space: [MB / MR, NB / NR]
-     * Block space:  [m  / MB, n  / NB]
+     * Block space:  [n  / NB,        ]
      **/
     int t1 = threadIdx.x / (NB / NR);
     int t2 = threadIdx.x % (NB / NR);
-    int b1 = blockIdx.x  / (n / NB);
-    int b2 = blockIdx.x  % (n / NB);
+    int b1 = blockIdx.x;
 
-    a += b1 * MB * k;
-    b += b2 * NB;
-    c += b1 * MB * n + b2 * NB;
+    for (int b2 = 0; b2 < n / NB; b2++) {
+        a += b1 * MB * k;
+        b += b2 * NB;
+        c += b1 * MB * n + b2 * NB;
 
-    for (int pp = 0; pp < k; pp += KB) {
-        load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, a, b, k, n, pp);
-        __syncthreads();
-        comp_pp<MB, KB, NB, MR, NR, THREADS>(c_reg, a_reg, b_reg, a_sh, b_sh);
-    }
+        for (int pp = 0; pp < k; pp += KB) {
+            load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, a, b, k, n, pp);
+            __syncthreads();
+            comp_pp<MB, KB, NB, MR, NR, THREADS>
+                   (c_reg, a_reg, b_reg, a_sh, b_sh);
+        }
 
-    for (int i = 0; i < MR; i++) {
-        for (int j = 0; j < NR; j++) {
-            int glob_i = t1 * MR + i;
-            int glob_j = t2 * NR + j;
-            c[glob_i * n + glob_j] = c_reg[i][j];
+        for (int i = 0; i < MR; i++) {
+            for (int j = 0; j < NR; j++) {
+                int glob_i = t1 * MR + i;
+                int glob_j = t2 * NR + j;
+                c[glob_i * n + glob_j] = c_reg[i][j];
+            }
         }
     }
 }
 
 /**
  * MB: reuse of B from global -> shared
- * KB: allows for vectorized loads of B, and some latency hiding
+ * KB: allows for vectorized loads of B, some latency hiding,
+       and instruction level parallelism for loads
  * NB: reuse of A from global -> shared
  * MR: reuse of B from shared -> registers
  * NR: reuse of A from shared -> registers
  **/
-template<int MB = 128, int KB = 8, int NB = 256, int MR = 8, int NR = 8>
+template<int MB = 32, int KB = 8, int NB = 1024, int MR = 8, int NR = 8>
 void matmul(float *c, float *a, float *b, int m, int k, int n)
 {
     constexpr int THREADS = (MB / MR) * (NB / NR);
-    int blocks    = (m / MB) * (n / NB);
+    int blocks            = m / MB;
 
     matmul_kernel<MB, KB, NB, MR, NR, THREADS>
                  <<<blocks, THREADS>>>
@@ -198,6 +219,7 @@ int main(int argc, char **argv)
 
     duration /= 1e3;
 
+    fprintf(stderr, "Duration: %lf s\n", duration);
     fprintf(stderr, "Gflops/s: ");
     printf("%f\n", 2.0 * m * n * k / duration / 1e9);
 
