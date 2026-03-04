@@ -12,16 +12,7 @@
 
 typedef float4 vec4;
 
-#define MR 8
-#define NR 8
-
-#define MB 128
-#define NB 256
-/* We block k to hide latency and get vectorized loads. */
-#define KB 8
-
-#define THREADS ((MB / MR) * (NB / NR))
-
+template<int MR, int NR>
 __device__
 void outer_product(float c[MR][NR], float a[MR], float b[NR])
 {
@@ -37,6 +28,7 @@ void outer_product(float c[MR][NR], float a[MR], float b[NR])
 /**
  * Duplicates column p across all rows in a 2D thread grid.
  **/
+template<int MB, int KB, int NB, int MR, int NR>
 __device__
 void bcast_col(float a_reg[MR], float a_sh[MB][KB], int p)
 {
@@ -50,6 +42,7 @@ void bcast_col(float a_reg[MR], float a_sh[MB][KB], int p)
 /**
  * Duplicates row p across all columns in a 2D thread grid.
  **/
+template<int KB, int NB, int NR>
 __device__
 void bcast_row(float b_reg[NR], float b_sh[KB][NB], int p)
 {
@@ -62,6 +55,7 @@ void bcast_row(float b_reg[NR], float b_sh[KB][NB], int p)
     }
 }
 
+template<int MB, int KB, int THREADS>
 __device__ void load_A(float a_sh[MB][KB], float *a, int ld)
 {
     /**
@@ -79,6 +73,7 @@ __device__ void load_A(float a_sh[MB][KB], float *a, int ld)
     }
 }
 
+template<int KB, int NB, int THREADS>
 __device__ void load_B(float b_sh[KB][NB], const float *b, int ld)
 {
     /**
@@ -93,25 +88,28 @@ __device__ void load_B(float b_sh[KB][NB], const float *b, int ld)
     }
 }
 
+template<int MB, int KB, int NB, int THREADS>
 __device__
 void load_pp(float a_sh[MB][KB], float b_sh[KB][NB],
              float *a, float *b, int k, int n, int pp)
 {
-    load_A(a_sh, a + pp    , k);
-    load_B(b_sh, b + pp * n, n);
+    load_A<MB, KB, THREADS>(a_sh, a + pp    , k);
+    load_B<KB, NB, THREADS>(b_sh, b + pp * n, n);
 }
 
+template<int MB, int KB, int NB, int MR, int NR, int THREADS>
 __device__
 void comp_pp(float c_reg[MR][NR], float a_reg[MR], float b_reg[NR],
              float a_sh[MB][KB], float b_sh[KB][NB])
 {
     for (int p = 0; p < KB; p++) {
-        bcast_col(b_reg, a_sh, p);
-        bcast_row(b_reg, b_sh, p);
-        outer_product(c_reg, a_reg, b_reg);
+        bcast_col<MB, KB, NB, MR, NR>(b_reg, a_sh, p);
+        bcast_row<KB, NB, NR>(b_reg, b_sh, p);
+        outer_product<MR, NR>(c_reg, a_reg, b_reg);
     }
 }
 
+template<int MB, int KB, int NB, int MR, int NR, int THREADS>
 __global__
 void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
 {
@@ -138,9 +136,9 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
     c += b1 * MB * n + b2 * NB;
 
     for (int pp = 0; pp < k; pp += KB) {
-        load_pp(a_sh, b_sh, a, b, k, n, pp);
+        load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, a, b, k, n, pp);
         __syncthreads();
-        comp_pp(c_reg, a_reg, b_reg, a_sh, b_sh);
+        comp_pp<MB, KB, NB, MR, NR, THREADS>(c_reg, a_reg, b_reg, a_sh, b_sh);
     }
 
     for (int i = 0; i < MR; i++) {
@@ -152,11 +150,22 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
     }
 }
 
+/**
+ * MB: reuse of B from global -> shared
+ * KB: allows for vectorized loads of B, and some latency hiding
+ * NB: reuse of A from global -> shared
+ * MR: reuse of B from shared -> registers
+ * NR: reuse of A from shared -> registers
+ **/
+template<int MB = 128, int KB = 8, int NB = 256, int MR = 8, int NR = 8>
 void matmul(float *c, float *a, float *b, int m, int k, int n)
 {
+    constexpr int THREADS = (MB / MR) * (NB / NR);
     int blocks    = (m / MB) * (n / NB);
-    
-    matmul_kernel<<<blocks, THREADS>>>(c, a, b, m, k, n);
+
+    matmul_kernel<MB, KB, NB, MR, NR, THREADS>
+                 <<<blocks, THREADS>>>
+                 (c, a, b, m, k, n);
     CUDA_SAFE(cudaDeviceSynchronize());
     CUDA_SAFE(cudaPeekAtLastError());
 }
