@@ -1,0 +1,202 @@
+/**
+ * We load blocks of A, B in shared memory for multiple iterations of k,
+ * so that we can hide some latency.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <cublas_v2.h>
+#include <debug.h>
+#include <test_code.h>
+#include <assert.h>
+
+typedef float4 vec4;
+
+#define MR 8
+#define NR 8
+
+#define MB 128
+#define NB 128
+/* We block k to hide latency and get vectorized loads. */
+#define KB 8
+
+#define THREADS ((MB / MR) * (NB / NR))
+
+__device__
+void outer_product(float c[MR][NR], float a[MR], float b[NR])
+{
+    /* We could use one register instead of MR per load of a,
+     * but it does not take that many registers, so maybe not necessary. */
+    for (int i = 0; i < MR; i++) {
+        for (int j = 0; j < NR; j++) {
+            c[i][j] += a[i] * b[j];
+        }
+    }
+}
+
+/**
+ * Duplicates column p across all rows in a 2D thread grid.
+ **/
+__device__
+void bcast_col(float a_reg[MR], float a_sh[MB][KB], int p)
+{
+    int t1 = threadIdx.x / (NB / NR);
+
+    for (int i = 0; i < MR; i++) {
+        a_reg[i] = a_sh[t1 * MR + i][p];
+    }
+}
+
+/**
+ * Duplicates row p across all columns in a 2D thread grid.
+ **/
+__device__
+void bcast_row(float b_reg[NR], float b_sh[KB][NB], int p)
+{
+    int t2 = threadIdx.x % (NB / NR);
+
+    vec4 *x   = (vec4 *)(&b_sh[p][t2 * NR]);
+    vec4 *res = (vec4 *)b_reg;
+    for (int i = 0; i < NR / 4; i++) {
+        res[i] = x[i];
+    }
+}
+
+__device__ void load_A(float a_sh[MB][KB], float *a, int ld)
+{
+    /**
+     * Thread space: [4 * THREADS / KB, KB / 4]
+     **/
+    int t1 = threadIdx.x / (KB / 4);
+    int t2 = threadIdx.x % (KB / 4);
+
+    /* Could make blockDim.x a macro as well. For this case, we know
+     * the loop is precisely one iteration. */
+    for (; t1 < MB; t1 += 4 * THREADS / KB) {
+        vec4 *a_vec  = (vec4 *)(a + t1 * ld + 4 * t2);
+        vec4 *sh_vec = (vec4 *)(&a_sh[t1][4 * t2]);
+        sh_vec[0] = a_vec[0];
+    }
+}
+
+__device__ void load_B(float b_sh[KB][NB], const float *b, int ld)
+{
+    /**
+     * Thread space: [4 * blockDim.x / NB, NB / 4]
+     **/
+    int t1 = threadIdx.x / (NB / 4);
+    int t2 = threadIdx.x % (NB / 4);
+    for (; t1 < KB; t1 += 4 * THREADS / NB) {
+        vec4 *b_vec  = (vec4 *)(b + t1 * ld + 4 * t2);
+        vec4 *sh_vec = (vec4 *)(&b_sh[t1][4 * t2]);
+        sh_vec[0] = b_vec[0];
+    }
+}
+
+__device__
+void load_pp(float a_sh[MB][KB], float b_sh[KB][NB],
+             float *a, float *b, int k, int n, int pp)
+{
+    load_A(a_sh, a + pp    , k);
+    load_B(b_sh, b + pp * n, n);
+}
+
+__device__
+void comp_pp(float c_reg[MR][NR], float a_reg[MR], float b_reg[NR],
+             float a_sh[MB][KB], float b_sh[KB][NB])
+{
+    for (int p = 0; p < KB; p++) {
+        bcast_col(b_reg, a_sh, p);
+        bcast_row(b_reg, b_sh, p);
+        outer_product(c_reg, a_reg, b_reg);
+    }
+}
+
+__global__
+void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
+{
+    assert(k % KB == 0);
+
+    __shared__ float a_sh[MB][KB];
+    __shared__ float b_sh[KB][NB];
+
+    float c_reg[MR][NR] = {(float)0};
+    float a_reg[MR];
+    float b_reg[NR];
+
+    /**
+     * Thread space: [MB / MR, NB / NR]
+     * Block space:  [m  / MB, n  / NB]
+     **/
+    int t1 = threadIdx.x / (NB / NR);
+    int t2 = threadIdx.x % (NB / NR);
+    int b1 = blockIdx.x  / (n / NB);
+    int b2 = blockIdx.x  % (n / NB);
+
+    a += b1 * MB * k;
+    b += b2 * NB;
+    c += b1 * MB * n + b2 * NB;
+
+    for (int pp = 0; pp < k; pp += KB) {
+        load_pp(a_sh, b_sh, a, b, k, n, pp);
+        __syncthreads();
+        comp_pp(c_reg, a_reg, b_reg, a_sh, b_sh);
+    }
+
+    for (int i = 0; i < MR; i++) {
+        for (int j = 0; j < NR; j++) {
+            int glob_i = t1 * MR + i;
+            int glob_j = t2 * NR + j;
+            c[glob_i * n + glob_j] = c_reg[i][j];
+        }
+    }
+}
+
+void matmul(float *c, float *a, float *b, int m, int k, int n)
+{
+    int blocks    = (m / MB) * (n / NB);
+    
+    matmul_kernel<<<blocks, THREADS>>>(c, a, b, m, k, n);
+    CUDA_SAFE(cudaDeviceSynchronize());
+    CUDA_SAFE(cudaPeekAtLastError());
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 4) {
+        printf("Usage: M K N\n");
+        return EXIT_FAILURE;
+    }
+
+    int m = atoi(argv[1]);
+    int k = atoi(argv[2]);
+    int n = atoi(argv[3]);
+
+    float *d_a, *d_b, *d_c;
+    init_all(&d_c, &d_a, &d_b, m, k, n);
+
+    float duration;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventRecord(start, 0);
+
+    matmul(d_c, d_a, d_b, m, k, n);
+
+    cudaEventCreate(&stop);
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&duration, start,stop);
+
+    duration /= 1e3;
+
+    fprintf(stderr, "Gflops/s: ");
+    printf("%f\n", 2.0 * m * n * k / duration / 1e9);
+
+    check(d_c, m, k, n);
+
+    CUDA_SAFE(cudaFree(d_a));
+    CUDA_SAFE(cudaFree(d_b));
+    CUDA_SAFE(cudaFree(d_c));
+
+    return EXIT_SUCCESS;
+}
