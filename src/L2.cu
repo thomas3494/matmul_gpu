@@ -185,11 +185,12 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
         }
 
         for (int i = 0; i < MR; i++) {
-            for (int j = 0; j < NR; j++) {
-                int glob_i = t1 * MR + i;
-                int glob_j = t2 * NR + j;
-                my_c[glob_i * n + glob_j] = c_reg[i][j];
-                c_reg[i][j] = 0;
+            int glob_i = t1 * MR + i;
+            vec4 *my_c_vec = (vec4 *)(my_c + glob_i * n + t2 * NR);
+            vec4 *c_reg_vec = (vec4 *)(c_reg[i]);
+            for (int j = 0; j < NR / 4; j++) {
+                my_c_vec[j] = c_reg_vec[j];
+                c_reg_vec[j] = make_float4(0.f, 0.f, 0.f, 0.f);
             }
         }
     }
