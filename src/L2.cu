@@ -17,18 +17,9 @@
  *
  * We make the blocks rectangular NB > MB, so we have enough blocks per column
  * to satisfy the SMs. Each thread block then loops over the columns.
- * The reuse of L2 is multiplied by the number of SMs, so small MB is ok.
- * 32 x 1024.
- *
- * The problem with this approach is that each SM reads the same element
- * at the same time, so it does not help with latency.
- *
- * Should block over k as well, and have each SM start reading at a different
- * offset. Then for the first iteration we have large latency, but after we
- * hit L2.
- *
- * But multiple thread blocks read at the same time, so doesn't really
- * help with latency. Maybe different blocks start reading at different points?
+ * The reuse of L2 is multiplied by the number of SMs, but the bandwidth of
+ * L2 is not that much higher than global memory, so we should not take
+ * NB >> MB.
  **/
 
 #include <stdio.h>
@@ -180,6 +171,9 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
                 if (pp < k) {
                     load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, my_a, my_b, k, n, pp);
                     __syncthreads();
+                    /* Profiling shows we are now waiting at a barrier, which
+                     * is why this is not actually faster, despite moving less
+                     * memory. */
                     comp_pp<MB, KB, NB, MR, NR, THREADS>
                            (c_reg, a_reg, b_reg, a_sh, b_sh);
                 }
