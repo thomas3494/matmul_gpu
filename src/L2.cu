@@ -9,7 +9,7 @@
  *              (2|      )
  *              (3|      )
  *              (4|      )
- * 
+ *
  *  (1|2|3|4)   (x|      )
  *  (1|2|3|4)   (x|      )
  *  (1|2|3|4)   (x|      )
@@ -19,6 +19,16 @@
  * to satisfy the SMs. Each thread block then loops over the columns.
  * The reuse of L2 is multiplied by the number of SMs, so small MB is ok.
  * 32 x 1024.
+ *
+ * The problem with this approach is that each SM reads the same element
+ * at the same time, so it does not help with latency.
+ *
+ * Should block over k as well, and have each SM start reading at a different
+ * offset. Then for the first iteration we have large latency, but after we
+ * hit L2.
+ *
+ * But multiple thread blocks read at the same time, so doesn't really
+ * help with latency. Maybe different blocks start reading at different points?
  **/
 
 #include <stdio.h>
@@ -136,35 +146,56 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
     __shared__ float a_sh[MB][KB];
     __shared__ float b_sh[KB][NB];
 
-    float c_reg[MR][NR] = {(float)0};
+    float c_reg[MR][NR] = {0.f};
     float a_reg[MR];
     float b_reg[NR];
 
-    /**
-     * Thread space: [MB / MR, NB / NR]
-     * Block space:  [n  / NB,        ]
-     **/
-    int t1 = threadIdx.x / (NB / NR);
-    int t2 = threadIdx.x % (NB / NR);
-    int b1 = blockIdx.x;
+    int t1       = threadIdx.x / (NB / NR);
+    int t2       = threadIdx.x % (NB / NR);
+    int blocks_x = (m / MB);
+    int blocks_y = (n / NB);
+    int block    = blockIdx.x;
 
-    for (int b2 = 0; b2 < n / NB; b2++) {
-        a += b1 * MB * k;
-        b += b2 * NB;
-        c += b1 * MB * n + b2 * NB;
+    for (; block < blocks_x * blocks_y; block += gridDim.x) {
+        int b1       = block % blocks_x;
+        int b2       = block / blocks_x;
 
-        for (int pp = 0; pp < k; pp += KB) {
-            load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, a, b, k, n, pp);
-            __syncthreads();
-            comp_pp<MB, KB, NB, MR, NR, THREADS>
-                   (c_reg, a_reg, b_reg, a_sh, b_sh);
+        /**
+         * Thread space: [MB / MR, NB / NR]
+         * Block space:  [m  / MB, n  / NB]
+         **/
+        float *my_a = a + b1 * MB * k;
+        float *my_b = b + b2 * NB;
+        float *my_c = c + b1 * MB * n + b2 * NB;
+
+        /**
+         * Collectively, the SMs read in KB * gridDim.x rows.
+         **/
+        for (int k_block = 0; k_block < k; k_block += KB * gridDim.x) 
+        {
+            /* We start at different offsets so we don't all request the same
+             * data. */
+            int pp = k_block + blockIdx.x * KB;
+            for (int i = 0; i < gridDim.x; i++) {
+                if (pp < k) {
+                    load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, my_a, my_b, k, n, pp);
+                    __syncthreads();
+                    comp_pp<MB, KB, NB, MR, NR, THREADS>
+                           (c_reg, a_reg, b_reg, a_sh, b_sh);
+                }
+                pp += KB;
+                if (pp == k_block + KB * gridDim.x) {
+                    pp = k_block;
+                }
+            }
         }
 
         for (int i = 0; i < MR; i++) {
             for (int j = 0; j < NR; j++) {
                 int glob_i = t1 * MR + i;
                 int glob_j = t2 * NR + j;
-                c[glob_i * n + glob_j] = c_reg[i][j];
+                my_c[glob_i * n + glob_j] = c_reg[i][j];
+                c_reg[i][j] = 0;
             }
         }
     }
@@ -178,11 +209,14 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
  * MR: reuse of B from shared -> registers
  * NR: reuse of A from shared -> registers
  **/
-template<int MB = 32, int KB = 8, int NB = 1024, int MR = 8, int NR = 8>
+template<int MB = 128, int KB = 8, int NB = 256, int MR = 8, int NR = 8>
 void matmul(float *c, float *a, float *b, int m, int k, int n)
 {
     constexpr int THREADS = (MB / MR) * (NB / NR);
-    int blocks            = m / MB;
+
+    cudaDeviceProp deviceProp;
+    CUDA_SAFE(cudaGetDeviceProperties(&deviceProp, 0));
+    int blocks = deviceProp.multiProcessorCount;
 
     matmul_kernel<MB, KB, NB, MR, NR, THREADS>
                  <<<blocks, THREADS>>>
