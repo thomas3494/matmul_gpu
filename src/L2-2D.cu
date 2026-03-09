@@ -310,7 +310,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Gflops/s: ");
     printf("%f\n", 2.0 * m * n * k / duration / 1e9);
 
-    check(d_c, m, k, n);
+    check(d_c, d_a, d_b, m, k, n);
 
     CUDA_SAFE(cudaFree(d_a));
     CUDA_SAFE(cudaFree(d_b));

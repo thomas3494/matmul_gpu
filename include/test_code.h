@@ -2,6 +2,7 @@
 
 #include <cuda.h>
 #include <debug.h>
+#include <math.h>
 
 __host__ __device__
 int ceil(int a, int b)
@@ -11,13 +12,13 @@ int ceil(int a, int b)
 
 struct InitA {
     __device__ __host__ float operator()(int i, int j) const {
-        return float(i) + 1;
+        return cosf(2.0 * M_PI * float(i + j) / 16384);
     }
 };
 
 struct InitB {
     __device__ __host__ float operator()(int i, int j) const {
-        return float(j) + 2;
+        return sinf(2.0 * M_PI * float(i + j) / 16384);
     }
 };
 
@@ -70,17 +71,28 @@ float rel_error(float a, float b)
     return fabs(a - b) / b;
 }
 
-void check(float *d_c, size_t m, size_t k, size_t n)
+void check(float *d_c, float *d_a, float *d_b, size_t m, size_t k, size_t n)
 {
-    float *c = (float *)malloc(m * n * sizeof(float));
+    float *c  = (float *)malloc(m * n * sizeof(float));
+    float *c2 = (float *)malloc(m * n * sizeof(float));
     CUDA_SAFE(cudaMemcpy(c, d_c, m * n * sizeof(float),
                 cudaMemcpyDeviceToHost));
 
+    cublasHandle_t handle;
+    CUBLAS_SAFE(cublasCreate(&handle));
+    const float alpha = 1.0;
+    const float beta = 0.0;
+    CUBLAS_SAFE(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
+                            &alpha, d_a, m, d_b, k, &beta, d_c, m));
+    CUDA_SAFE(cudaMemcpy(c2, d_c, m * n * sizeof(float),
+                cudaMemcpyDeviceToHost));
+    CUBLAS_SAFE(cublasDestroy(handle));
+
     for (int i = 0; i < m; i++) {
         for (int j = 0; j < n; j++) {
-            /* We can incur 2^(-24) per addition... */
-            if (rel_error(c[i * n + j], k * (i + 1) * (j + 2)) > k * 1e-7) {
-                printf("c[%d, %d] = %f\n", i, j, c[i * n + j]);
+            if (rel_error(c[i * n + j], c2[i * n + j]) > 1e-6) {
+                printf("c[%d, %d] = %f != %f\n",
+                       i, j, c[i * n + j], c2[i * n + j]);
                 goto loop_break;
             }
         }

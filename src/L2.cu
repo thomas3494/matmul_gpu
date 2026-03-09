@@ -1,25 +1,27 @@
 /**
- * The idea is as follows.
- * To compute the column of C marked with x's, we read that column
- * of B in order 1, 2, 3, 4. So if these columns are computed at the same
- * time, we can store it in L2 (4 MB on 3070).
- * 
+ * We use L2-cache so we can block over all SM, increasing reuse.
+ * Important to note: L2 is not that much faster than VRAM.
  *
- *              (1|      )
- *              (2|      )
- *              (3|      )
- *              (4|      )
+ * Suppose we have 4 SM's. Then we would compute the block marked by x's as
+ * follows:
  *
- *  (1|2|3|4)   (x|      )
- *  (1|2|3|4)   (x|      )
- *  (1|2|3|4)   (x|      )
- *  (1|2|3|4)   (x|      )
+ *              (1|1     )
+ *              (2|2     )
+ *              (3|3     )
+ *              (4|4     )
  *
- * We make the blocks rectangular NB > MB, so we have enough blocks per column
- * to satisfy the SMs. Each thread block then loops over the columns.
- * The reuse of L2 is multiplied by the number of SMs, but the bandwidth of
- * L2 is not that much higher than global memory, so we should not take
- * NB >> MB.
+ *  (1|2|3|4)   (x|x|    )
+ *  (1|2|3|4)   (x|x|    )
+ *  (       )   (        )
+ *  (       )   (        )
+ *
+ * Here 1, 2, 3, 4, represent the order in which we update the block.
+ * Both A and B are reused by two SMs now.
+ *
+ * To hide latency, we should block the k-loop and have each SM in a row/column
+ * start at a different point.
+ *
+ * For simplicity of implementation, this file uses a 1D SM grid.
  **/
 
 #include <stdio.h>
@@ -197,10 +199,10 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
 }
 
 /**
- * MB: reuse of B from global -> shared
+ * MB: reuse of B from L2      -> shared
  * KB: allows for vectorized loads of B, some latency hiding,
        and instruction level parallelism for loads
- * NB: reuse of A from global -> shared
+ * NB: reuse of A from L2     -> shared
  * MR: reuse of B from shared -> registers
  * NR: reuse of A from shared -> registers
  **/
@@ -252,7 +254,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Gflops/s: ");
     printf("%f\n", 2.0 * m * n * k / duration / 1e9);
 
-    check(d_c, m, k, n);
+    check(d_c, d_a, d_b, m, k, n);
 
     CUDA_SAFE(cudaFree(d_a));
     CUDA_SAFE(cudaFree(d_b));
