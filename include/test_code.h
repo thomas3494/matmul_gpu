@@ -17,6 +17,17 @@ struct Zero {
     }
 };
 
+struct DCT {
+    int n;
+
+    __host__ __device__
+    DCT(int n_in) : n(n_in) {}
+
+    __device__ __host__ float operator()(int i, int j) const {
+        return cosf(M_PI / n * (i + 0.5) * j);
+    }
+};
+
 template<typename F>
 __global__
 void init_d(float *x, int m, int n, F f)
@@ -27,29 +38,6 @@ void init_d(float *x, int m, int n, F f)
     if (i < m && j < n) {
         x[i * n + j] = f(i, j);
     }
-}
-
-__global__ 
-void initRandomMatrix_kernel(float *matrix, int elems, unsigned long seed)
-{
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    curandState state;
-    curand_init(seed, t, 0, &state);
-
-    for (; t < elems; t += blockDim.x) {
-        matrix[t] = curand_uniform(&state);
-    }
-}
-
-void initRandomMatrix(float *matrix, int m, int n, unsigned long seed)
-{
-    int SMs;
-    cudaDeviceGetAttribute(&SMs, cudaDevAttrMultiProcessorCount, 0);
-
-    dim3 block(256);
-    dim3 grid(SMs);
-
-    initRandomMatrix_kernel<<<grid, block>>>(matrix, m * n, seed);
 }
 
 template<typename F>
@@ -73,8 +61,8 @@ void init_all(float **d_c, float **d_a, float **d_b,
     CUDA_SAFE(cudaMalloc(d_b, k * n * sizeof(float)));
     CUDA_SAFE(cudaMalloc(d_c, m * n * sizeof(float)));
 
-    initRandomMatrix(*d_a, m, k, 12390123ul);
-    initRandomMatrix(*d_b, k, n, 192309123ul);
+    init(*d_a, m, k, DCT(k));
+    init(*d_b, k, n, DCT(n));
     init(*d_c, m, n, Zero());
 }
 
