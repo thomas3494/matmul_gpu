@@ -204,9 +204,6 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
          * Globally, we have
          *    Thread space: [MB / MR, NB / NR]
          *    Block space:  [m  / MB, n  / NB]
-         *
-         * For reading a with vector loads, we have
-         *    Thread space: [4 * THREADS / KB, KB / 4]
          **/
         vec4 *my_a = (vec4 *)(a + b1 * MB * k + 4 * threadIdx.x % (KB / 4));
         vec4 *my_b = (vec4 *)(b + b2 * NB     + 4 * threadIdx.x % (NB / 4));
@@ -260,7 +257,7 @@ void factor(int n /* in */, int *n1 /* out */, int *n2 /* out */)
  * MR: reuse of B from shared -> registers
  * NR: reuse of A from shared -> registers
  **/
-template<int MB = 128, int KB = 16, int NB = 256, int MR = 8, int NR = 8>
+template<int MB = 128, int KB = 32, int NB = 256, int MR = 8, int NR = 8>
 void matmul(float *c, float *a, float *b, int m, int k, int n)
 {
     constexpr int THREADS = (MB / MR) * (NB / NR);
