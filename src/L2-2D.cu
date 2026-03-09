@@ -260,7 +260,7 @@ void factor(int n /* in */, int *n1 /* out */, int *n2 /* out */)
  * MR: reuse of B from shared -> registers
  * NR: reuse of A from shared -> registers
  **/
-template<int MB = 128, int KB = 8, int NB = 256, int MR = 8, int NR = 8>
+template<int MB = 128, int KB = 16, int NB = 256, int MR = 8, int NR = 8>
 void matmul(float *c, float *a, float *b, int m, int k, int n)
 {
     constexpr int THREADS = (MB / MR) * (NB / NR);
