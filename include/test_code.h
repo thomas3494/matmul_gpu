@@ -3,24 +3,13 @@
 #include <cuda.h>
 #include <debug.h>
 #include <math.h>
+#include <curand_kernel.h>
 
 __host__ __device__
 int ceil(int a, int b)
 {
     return (a + b - 1) / b;
 }
-
-struct InitA {
-    __device__ __host__ float operator()(int i, int j) const {
-        return cosf(2.0 * M_PI * float(i + j) / 16384);
-    }
-};
-
-struct InitB {
-    __device__ __host__ float operator()(int i, int j) const {
-        return sinf(2.0 * M_PI * float(i + j) / 16384);
-    }
-};
 
 struct Zero {
     __device__ __host__ float operator()(int, int) const {
@@ -38,6 +27,31 @@ void init_d(float *x, int m, int n, F f)
     if (i < m && j < n) {
         x[i * n + j] = f(i, j);
     }
+}
+
+__global__ 
+void initRandomMatrix_kernel(float *matrix, int m, int n, unsigned long seed)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * n;
+
+    if (idx < total) {
+        // Initialize random state
+        curandState state;
+        curand_init(seed, idx, 0, &state);
+
+        // Generate random float between 0 and 1
+        matrix[idx] = curand_uniform(&state);
+    }
+}
+
+void initRandomMatrix(float *matrix, int m, int n, unsigned long seed)
+{
+    int threads_x = 16;
+    int threads_y = 16;
+    dim3 threads(threads_x, threads_y);
+    dim3 blocks (ceil(m, threads_x), ceil(n, threads_y));
+    initRandomMatrix_kernel<<<blocks, threads>>>(matrix, m, n, seed);
 }
 
 template<typename F>
@@ -61,8 +75,8 @@ void init_all(float **d_c, float **d_a, float **d_b,
     CUDA_SAFE(cudaMalloc(d_b, k * n * sizeof(float)));
     CUDA_SAFE(cudaMalloc(d_c, m * n * sizeof(float)));
 
-    init(*d_a, m, k, InitA());
-    init(*d_b, k, n, InitB());
+    initRandomMatrix(*d_a, m, k, 12390123ul);
+    initRandomMatrix(*d_b, k, n, 192309123ul);
     init(*d_c, m, n, Zero());
 }
 
