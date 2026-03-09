@@ -1,5 +1,6 @@
 Some experiments with matrix multiplication (fp32) in CUDA.
-cublas only achieves a little over half of peak performance.
+cublas only achieves a little over half of peak performance on the 3070, which
+is interesting. The simple blocking outperforms this slightly.
 
 1. simple   : straightforward blocking over global and shared-memory.
 2. one-block: same as simple, but one block per streaming multiprocessor.

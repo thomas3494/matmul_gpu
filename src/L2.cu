@@ -29,6 +29,7 @@
 #include <cublas_v2.h>
 #include <debug.h>
 #include <test_code.h>
+#include <bench.h>
 #include <assert.h>
 
 typedef float4 vec4;
@@ -236,25 +237,13 @@ int main(int argc, char **argv)
     float *d_a, *d_b, *d_c;
     init_all(&d_c, &d_a, &d_b, m, k, n);
 
-    float duration;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventRecord(start, 0);
-
-    matmul(d_c, d_a, d_b, m, k, n);
-
-    cudaEventCreate(&stop);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&duration, start,stop);
-
-    duration /= 1e3;
-
-    fprintf(stderr, "Duration: %lf s\n", duration);
-    fprintf(stderr, "Gflops/s: ");
-    printf("%f\n", 2.0 * m * n * k / duration / 1e9);
-
+#ifndef PROFILE
+    BENCH(matmul(d_c, d_a, d_b, m, k, n),
+          1e-9 * 2.0 * m * n * k, 10);
     check(d_c, d_a, d_b, m, k, n);
+#else
+    matmul(d_c, d_a, d_b, m, k, n);
+#endif
 
     CUDA_SAFE(cudaFree(d_a));
     CUDA_SAFE(cudaFree(d_b));

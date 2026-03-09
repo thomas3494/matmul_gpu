@@ -30,28 +30,26 @@ void init_d(float *x, int m, int n, F f)
 }
 
 __global__ 
-void initRandomMatrix_kernel(float *matrix, int m, int n, unsigned long seed)
+void initRandomMatrix_kernel(float *matrix, int elems, unsigned long seed)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = m * n;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    curandState state;
+    curand_init(seed, t, 0, &state);
 
-    if (idx < total) {
-        // Initialize random state
-        curandState state;
-        curand_init(seed, idx, 0, &state);
-
-        // Generate random float between 0 and 1
-        matrix[idx] = curand_uniform(&state);
+    for (; t < elems; t += blockDim.x) {
+        matrix[t] = curand_uniform(&state);
     }
 }
 
 void initRandomMatrix(float *matrix, int m, int n, unsigned long seed)
 {
-    int threads_x = 16;
-    int threads_y = 16;
-    dim3 threads(threads_x, threads_y);
-    dim3 blocks (ceil(m, threads_x), ceil(n, threads_y));
-    initRandomMatrix_kernel<<<blocks, threads>>>(matrix, m, n, seed);
+    int SMs;
+    cudaDeviceGetAttribute(&SMs, cudaDevAttrMultiProcessorCount, 0);
+
+    dim3 block(256);
+    dim3 grid(SMs);
+
+    initRandomMatrix_kernel<<<grid, block>>>(matrix, m * n, seed);
 }
 
 template<typename F>
