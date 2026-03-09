@@ -84,19 +84,18 @@ void bcast_col(float a_reg[MR], float a_sh[MB][KB], int p)
  **/
 template<int KB, int NB, int NR>
 __device__
-void bcast_row(float b_reg[NR], float b_sh[KB][NB], int p)
+void bcast_row(float b_reg[NR], vec4 b_sh[KB][NB / 4], int p)
 {
     int t2 = threadIdx.x % (NB / NR);
 
-    vec4 *x   = (vec4 *)(&b_sh[p][t2 * NR]);
     vec4 *res = (vec4 *)b_reg;
     for (int i = 0; i < NR / 4; i++) {
-        res[i] = x[i];
+        res[i] = b_sh[p][t2 * NR / 4];
     }
 }
 
 template<int MB, int KB, int THREADS>
-__device__ void load_A(float a_sh[MB][KB], float *a, int ld)
+__device__ void load_A(float a_sh[MB][KB], vec4 *a, int ld)
 {
     /**
      * Thread space: [4 * THREADS / KB, KB / 4]
@@ -104,17 +103,14 @@ __device__ void load_A(float a_sh[MB][KB], float *a, int ld)
     int t1 = threadIdx.x / (KB / 4);
     int t2 = threadIdx.x % (KB / 4);
 
-    /* Could make blockDim.x a macro as well. For this case, we know
-     * the loop is precisely one iteration. */
     for (; t1 < MB; t1 += 4 * THREADS / KB) {
-        vec4 *a_vec  = (vec4 *)(a + t1 * ld + 4 * t2);
         vec4 *sh_vec = (vec4 *)(&a_sh[t1][4 * t2]);
-        sh_vec[0] = a_vec[0];
+        sh_vec[0] = a[t1 * ld];
     }
 }
 
 template<int KB, int NB, int THREADS>
-__device__ void load_B(float b_sh[KB][NB], const float *b, int ld)
+__device__ void load_B(vec4 b_sh[KB][NB / 4], const vec4 *b, int ld)
 {
     /**
      * Thread space: [4 * blockDim.x / NB, NB / 4]
@@ -122,25 +118,23 @@ __device__ void load_B(float b_sh[KB][NB], const float *b, int ld)
     int t1 = threadIdx.x / (NB / 4);
     int t2 = threadIdx.x % (NB / 4);
     for (; t1 < KB; t1 += 4 * THREADS / NB) {
-        vec4 *b_vec  = (vec4 *)(b + t1 * ld + 4 * t2);
-        vec4 *sh_vec = (vec4 *)(&b_sh[t1][4 * t2]);
-        sh_vec[0] = b_vec[0];
+        b_sh[t1][t2] = b[t1 * ld];
     }
 }
 
 template<int MB, int KB, int NB, int THREADS>
 __device__
-void load_pp(float a_sh[MB][KB], float b_sh[KB][NB],
-             float *a, float *b, int k, int n, int pp)
+void load_pp(float a_sh[MB][KB], vec4 b_sh[KB][NB / 4],
+             vec4 *a, vec4 *b, int k, int n, int pp)
 {
-    load_A<MB, KB, THREADS>(a_sh, a + pp    , k);
-    load_B<KB, NB, THREADS>(b_sh, b + pp * n, n);
+    load_A<MB, KB, THREADS>(a_sh, a + pp / 4, k / 4);
+    load_B<KB, NB, THREADS>(b_sh, b + pp * n / 4, n / 4);
 }
 
 template<int MB, int KB, int NB, int MR, int NR, int THREADS>
 __device__
 void comp_pp(float c_reg[MR][NR], float a_reg[MR], float b_reg[NR],
-             float a_sh[MB][KB], float b_sh[KB][NB])
+             float a_sh[MB][KB], vec4 b_sh[KB][NB / 4])
 {
     for (int p = 0; p < KB; p++) {
         bcast_col<MB, KB, NB, MR, NR>(b_reg, a_sh, p);
@@ -149,14 +143,48 @@ void comp_pp(float c_reg[MR][NR], float a_reg[MR], float b_reg[NR],
     }
 }
 
+/**
+ * Sums outer product of 
+ *    a[k_block:k_block + KB * gridDim.y - 1 .] and 
+ *    and
+ *    b[., k_block:k_block + KB * gridDim.y]
+ * Blocks start at a different offset to collectively read this into L2
+ * as fast as possible.
+ **/
+template<int MB, int KB, int NB, int MR, int NR, int THREADS>
+__device__
+void block_iter(vec4 *my_a, vec4 *my_b, int m, int k, int n,
+                float a_sh[MB][KB], vec4 b_sh[KB][NB / 4],
+                float c_reg[MR][NR], float a_reg[MR], float b_reg[NR],
+                int k_block, int block_id)
+{
+    int pp = k_block + block_id * KB;
+    for (int i = 0; i < gridDim.y; i++) {
+        if (pp < k) {
+            load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, my_a, my_b, k, n, pp);
+            __syncthreads();
+            /* Profiling shows we are now waiting at a barrier, which
+             * is why this is not actually faster, despite moving less
+             * memory. */
+            comp_pp<MB, KB, NB, MR, NR, THREADS>
+                   (c_reg, a_reg, b_reg, a_sh, b_sh);
+        }
+        pp += KB;
+        if (pp == k_block + KB * gridDim.y) {
+            pp = k_block;
+        }
+    }
+}
+
 template<int MB, int KB, int NB, int MR, int NR, int THREADS>
 __global__
 void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
 {
     assert(k % KB == 0);
+    assert(m >= gridDim.y * MB);
 
     __shared__ float a_sh[MB][KB];
-    __shared__ float b_sh[KB][NB];
+    __shared__ vec4  b_sh[KB][NB / 4];
 
     float c_reg[MR][NR] = {0.f};
     float a_reg[MR];
@@ -173,49 +201,36 @@ void matmul_kernel(float *c, float *a, float *b, int m, int k, int n)
 
     for (; block < blocks_x * blocks_y; block += gridDim.x * gridDim.y) {
         /**
-         * Thread space: [MB / MR, NB / NR]
-         * Block space:  [m  / MB, n  / NB]
+         * Globally, we have
+         *    Thread space: [MB / MR, NB / NR]
+         *    Block space:  [m  / MB, n  / NB]
+         *
+         * For reading a with vector loads, we have
+         *    Thread space: [4 * THREADS / KB, KB / 4]
          **/
-        float *my_a = a + b1 * MB * k;
-        float *my_b = b + b2 * NB;
-        float *my_c = c + b1 * MB * n + b2 * NB;
+        vec4 *my_a = (vec4 *)(a + b1 * MB * k + 4 * threadIdx.x % (KB / 4));
+        vec4 *my_b = (vec4 *)(b + b2 * NB     + 4 * threadIdx.x % (NB / 4));
+        vec4 *my_c = (vec4 *)(c + b1 * MB * n + b2 * NB + t2 * NR);
 
         /**
-         * Collectively, the SMs read in KB * gridDim.x rows.
+         * Collectively, the SMs read in KB * gridDim.y rows.
          **/
-        for (int k_block = 0; k_block < k; k_block += KB * gridDim.x) 
+        for (int k_block = 0; k_block < k; k_block += KB * gridDim.y)
         {
-            /* We start at different offsets so we don't all request the same
-             * data. */
-            int pp = k_block + blockIdx.x * KB;
-            for (int i = 0; i < gridDim.x; i++) {
-                if (pp < k) {
-                    load_pp<MB, KB, NB, THREADS>(a_sh, b_sh, my_a, my_b, k, n, pp);
-                    __syncthreads();
-                    /* Profiling shows we are now waiting at a barrier, which
-                     * is why this is not actually faster, despite moving less
-                     * memory. */
-                    comp_pp<MB, KB, NB, MR, NR, THREADS>
-                           (c_reg, a_reg, b_reg, a_sh, b_sh);
-                }
-                pp += KB;
-                if (pp == k_block + KB * gridDim.x) {
-                    pp = k_block;
-                }
-            }
+            block_iter<MB, KB, NB, MR, NR, THREADS>
+                (my_a, my_b, m, k, n,
+                 a_sh, b_sh, c_reg, a_reg, b_reg, k_block, blockIdx.y);
         }
 
         for (int i = 0; i < MR; i++) {
             int glob_i = t1 * MR + i;
-            vec4 *my_c_vec = (vec4 *)(my_c + glob_i * n + t2 * NR);
             vec4 *c_reg_vec = (vec4 *)(c_reg[i]);
             for (int j = 0; j < NR / 4; j++) {
-                my_c_vec[j] = c_reg_vec[j];
+                my_c[glob_i * n / 4 + j] = c_reg_vec[j];
                 c_reg_vec[j] = make_float4(0.f, 0.f, 0.f, 0.f);
             }
         }
 
-        /* TODO: Little janky, will probably fail on small grids */
         b1 += gridDim.y;
         if (b1 >= blocks_x) {
             b1 -= blocks_x;
