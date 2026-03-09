@@ -6,3 +6,7 @@ is interesting. The simple blocking outperforms this slightly.
 2. one-block: same as simple, but one block per streaming multiprocessor.
 3. L2       : blocking over L2, simple 1D blocking
 4. L2-2D    : 2D blocking over L2
+5. TODO     : support general sizes, not just nicely divisible. Would allow for
+              more square blocks.
+6. TODO     : block 2D that is not precisely divisible for more even split
+              between A and B reuse.

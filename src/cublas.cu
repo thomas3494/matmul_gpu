@@ -24,11 +24,15 @@ int main(int argc, char **argv)
     const float alpha = 1.0;
     const float beta = 0.0;
 
+#ifndef PROFILE
     BENCH(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
                       &alpha, d_a, m, d_b, k, &beta, d_c, m),
                       1e-9 * 2.0 * m * n * k, 10);
-
     check(d_c, d_a, d_b, m, k, n);
+#else
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
+                &alpha, d_a, m, d_b, k, &beta, d_c, m);
+#endif
 
     CUBLAS_SAFE(cublasDestroy(handle));
     CUDA_SAFE(cudaFree(d_a));
